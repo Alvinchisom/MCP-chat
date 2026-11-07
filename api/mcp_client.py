@@ -1,55 +1,47 @@
 import asyncio
-import json
-import os
-import sys
-import traceback
-from contextlib import AsyncExitStack
+from json import tool
 from typing import Optional
+from contextlib import AsyncExitStack
+import traceback
 
-from dotenv import load_dotenv
-from groq import AsyncGroq
+# from utils.logger import logger
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from datetime import datetime
+from utils.logger import logger
+import json
+import os
+from dotenv import load_dotenv
+from anthropic import Anthropic
+from anthropic.types import Message
+import groq
 
-# Support running directly or as a module
-try:
-    from utils.logger import logger
-except ModuleNotFoundError:
-    from api.utils.logger import logger
+load_dotenv()
+
+api_key = os.getenv("GROQ_API_KEY")
+
 
 
 class MCP_Client:
-    def __init__(self, model: str = "llama-3.3-70b-versatile"):
-        load_dotenv()
-        # Checks for GROQ_API_KEY or Groq_api_key in .env
-        api_key = os.getenv("GROQ_API_KEY") or os.getenv("Groq_api_key")
-        if not api_key:
-            raise ValueError(
-                "Groq API key not found. Please set GROQ_API_KEY (or Groq_api_key) in your .env file."
-            )
-
+    def __init__(self):
+        # Initialize session and client objects
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
         self.llm = AsyncGroq(api_key=api_key)
-        self.model = model
         self.tools = []
         self.messages = []
         self.logger = logger
 
-    # Connect to MCP server
-    async def connect_to_server(self, server_script_path: str):
+    # connect to mcp server
+    async def connect_to_server(self,server_script_path:str):
         try:
             is_python = server_script_path.endswith(".py")
             is_js = server_script_path.endswith(".js")
             if not (is_python or is_js):
-                raise ValueError("Server script must be a .py or .js file")
-
-            # Use current virtualenv's Python on Windows/Mac/Linux
-            command = sys.executable if is_python else "node"
+                raise ValueError("Server script must be .py or .js file")
+            command = "python" if is_python else "node"
             server_parameters = StdioServerParameters(
-                command=command,
-                arguments=[server_script_path],
-                env=dict(os.environ),
+                command=command, arguments=[server_script_path], env=None
             )
 
             stdio_transport = await self.exit_stack.enter_async_context(
@@ -62,29 +54,26 @@ class MCP_Client:
             await self.session.initialize()
             self.logger.info("Connected to MCP server")
 
-            # Get MCP tools and format them for Groq (OpenAI function-calling format)
+            # get mcl tool
             mcp_tools = await self.get_mcp_tools()
             self.tools = [
                 {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description or "",
-                        "parameters": tool.inputSchema,
-                    },
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.inputSchema,
                 }
                 for tool in mcp_tools
             ]
-            self.logger.info(
-                f"Available tools: {[t['function']['name'] for t in self.tools]}"
-            )
+            self.logger.info(f"Available tools:{self.tools}")
 
         except Exception as e:
             self.logger.error(f"Error Connecting to MCP Server: {e}")
             traceback.print_exc()
             raise
 
-    # Get MCP tool list
+    #call a mcp tool
+
+    #get mcp tool list
     async def get_mcp_tools(self):
         try:
             response = await self.session.list_tools()
@@ -93,73 +82,61 @@ class MCP_Client:
             self.logger.error(f"Error getting tools: {e}")
             raise
 
-    # Process query
-    async def process_query(self, query: str):
+    #process query
+    async def process_query(self,query:str):
         try:
             self.logger.info(f"Processing query: {query}")
-            user_message = {"role": "user", "content": query}
-            self.messages.append(user_message)
+            user_message = {"role": "user","context":query}
+            self.message = [user_message]
 
             while True:
                 response = await self.call_llm()
-                choice = response.choices[0]
-                response_message = choice.message
 
-                # If no tool calls were requested, return the final text response
-                if not response_message.tool_calls:
+                # if response is a test response
+                if response.content[0].type == "text" and len(response.content) == 1:
                     assistant_message = {
                         "role": "assistant",
-                        "content": response_message.content or "",
+                        "content": response.content[0].text,
                     }
                     self.messages.append(assistant_message)
                     await self.log_conversation()
                     break
 
-                # If the model requested tool calls, add assistant message to history
-                self.messages.append(response_message)
+                # if response is a tool calling response
+                assistant_message = {
+                    "role": "assistant",
+                    "content": response.to_dict()["content"],
+                }
+                self.messages.append(assistant_message)
                 await self.log_conversation()
 
-                # Call each tool requested by the model
-                for tool_call in response_message.tool_calls:
-                    tool_name = tool_call.function.name
-                    tool_args = (
-                        json.loads(tool_call.function.arguments)
-                        if isinstance(tool_call.function.arguments, str)
-                        else tool_call.function.arguments
-                    )
-                    self.logger.info(
-                        f"Calling tool {tool_name} with args {tool_args}"
-                    )
-                    try:
-                        result = await self.session.call_tool(tool_name, tool_args)
-                        # Extract text from MCP CallToolResult
-                        if hasattr(result, "content") and isinstance(
-                            result.content, list
-                        ):
-                            content_str = "\n".join(
-                                item.text if hasattr(item, "text") else str(item)
-                                for item in result.content
-                            )
-                        else:
-                            content_str = str(result)
-
+                for content in response.content:
+                    if content.type == "tool_use":
+                        tool_name = content.name
+                        tool_args = content.input
+                        tool_use_id = content.id
                         self.logger.info(
-                            f"Tool {tool_name} result: {content_str[:200]}..."
+                            f"Calling tool {tool_name} with args {tool_args}"
                         )
-
-                        # Append tool result in Groq/OpenAI format
-                        self.messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": tool_name,
-                                "content": content_str,
-                            }
-                        )
-                        await self.log_conversation()
-                    except Exception as e:
-                        self.logger.error(f"Error calling tool {tool_name}: {e}")
-                        raise
+                        try:
+                            result = await self.session.call_tool(tool_name, tool_args)
+                            self.logger.info(f"Tool {tool_name} result: {result}...")
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "tool_result",
+                                            "tool_use_id": tool_use_id,
+                                            "content": result.content,
+                                        }
+                                    ],
+                                }
+                            )
+                            await self.log_conversation()
+                        except Exception as e:
+                            self.logger.error(f"Error calling tool {tool_name}: {e}")
+                            raise
 
             return self.messages
 
@@ -168,42 +145,31 @@ class MCP_Client:
             traceback.print_exc()
             raise
 
-    # Call LLM (Groq)
+    # call llm
     async def call_llm(self):
         try:
-            self.logger.info("Calling LLM (Groq)")
-            return await self.llm.chat.completions.create(
-                model=self.model,
-                messages=self.messages,
-                tools=self.tools if self.tools else None,
-                max_tokens=2048,
+            self.logger.info("Calling LLM")
+            return await self.llm.message.create(
+                model = "openai/gpt-oss-120b",
+                max_token = 2048,
+                message = self.message,
+                tool = self.tools,
             )
+
         except Exception as e:
-            self.logger.error(f"Error when calling LLM: {e}")
+            self.logger.error(f"Error when calling llm: {e}")
             raise
 
-    # Clean up
+    #clean up
     async def cleanup(self):
         try:
             await self.exit_stack.aclose()
             self.logger.info("Disconnected from MCP server")
         except Exception as e:
-            self.logger.error(f"Error during cleanup: {e}")
+            self.logger.error(f"Error During cleanup: {e}")
             traceback.print_exc()
             raise
 
-    # Log conversation history to file
-    async def log_conversation(self):
-        try:
-            serialized = []
-            for msg in self.messages:
-                if hasattr(msg, "model_dump"):
-                    serialized.append(msg.model_dump())
-                elif isinstance(msg, dict):
-                    serialized.append(msg)
-                else:
-                    serialized.append(str(msg))
-            with open("conversation_history.json", "w", encoding="utf-8") as f:
-                json.dump(serialized, f, indent=2, default=str)
-        except Exception as e:
-            self.logger.warning(f"Could not log conversation: {e}")
+    #extra
+
+    #log coversation
