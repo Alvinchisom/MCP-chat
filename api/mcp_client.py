@@ -66,6 +66,8 @@ class MCP_Client:
             ]
             self.logger.info(f"Available tools:{self.tools}")
 
+            return True
+
         except Exception as e:
             self.logger.error(f"Error Connecting to MCP Server: {e}")
             traceback.print_exc()
